@@ -11,7 +11,7 @@ use windows_sys::{
     Win32::{
         Foundation::*,
         Graphics::{Dwm::*, Gdi::*, GdiPlus as gp},
-        System::{Com::*, LibraryLoader::*, Threading::{AttachThreadInput, GetCurrentThreadId}},
+        System::{Com::*, LibraryLoader::*, Power::SetSuspendState, Shutdown::{ExitWindowsEx, LockWorkStation, EWX_LOGOFF}, Threading::{AttachThreadInput, GetCurrentThreadId}},
         UI::{Accessibility::AccessibleObjectFromWindow, Controls::{ImageList_GetIcon, HIMAGELIST, ILD_TRANSPARENT, MARGINS, WM_MOUSELEAVE}, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
     },
 };
@@ -23,6 +23,8 @@ const TOGGLE: u32 = WM_APP + 1;
 const TRAY: u32 = WM_APP + 2;
 const CATALOG_READY: u32 = WM_APP + 3;
 const CATALOG_SCRIPT: &str = include_str!("../catalogo.ps1");
+const UNINSTALL_SCRIPT: &str = include_str!("../desinstalar.ps1");
+const NOT_FOUND: i32 = 2;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const POLL_START: usize = 1;
 const POLL_BAR: usize = 2;
@@ -38,6 +40,8 @@ const TILE_H: i32 = 84;
 const ROW_H: i32 = 36;
 const VISIBLE_ROWS: usize = 7;
 const FOOTER: i32 = 408;
+const PROFILE_RECT: RECT = RECT { left: 32, top: FOOTER + 8, right: 300, bottom: H - 8 };
+const POWER_RECT: RECT = RECT { left: W - 80, top: FOOTER + 8, right: W - 32, bottom: H - 8 };
 const TOGGLE_RECT: RECT = RECT { left: W - 132, top: 84, right: W - 32, bottom: 112 };
 const PARGB: i32 = 0xE200B;
 const ARGB: i32 = 0x26200A;
@@ -118,22 +122,47 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
+fn quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+// Embedded scripts run through -EncodedCommand so the exe ships alone, without .ps1 files next to it.
+fn run_script(script: &str, args: &[(&str, &str)]) -> Option<i32> {
+    use std::os::windows::process::CommandExt;
+    let params: String = args.iter().map(|(name, value)| format!(" -{name} {}", quoted(value))).collect();
+    let command = format!("& {{\n{script}\n}}{params}");
+    let encoded = base64(&command.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>());
+    std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", &encoded])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .ok()?
+        .code()
+}
+
 // Get-StartApps plus Appx manifests take ~15 s, so the catalog is rebuilt off the UI thread.
 fn rebuild_catalog(hwnd: HWND) {
     let hwnd = hwnd as isize;
     std::thread::spawn(move || {
-        use std::os::windows::process::CommandExt;
-        let output = root().join("apps.tsv").to_string_lossy().replace('\'', "''");
-        let command = format!("& {{\n{CATALOG_SCRIPT}\n}} -Saida '{output}'");
-        let encoded = base64(&command.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>());
-        let done = std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", &encoded])
-            .creation_flags(CREATE_NO_WINDOW)
-            .status()
-            .is_ok_and(|s| s.success());
-        if done {
+        let output = root().join("apps.tsv").to_string_lossy().into_owned();
+        if run_script(CATALOG_SCRIPT, &[("Saida", &output)]) == Some(0) {
             unsafe { PostMessageW(hwnd as HWND, CATALOG_READY, 0, 0) };
         }
+    });
+}
+
+unsafe fn uninstall(hwnd: HWND, app: &App) {
+    ShowWindow(hwnd, SW_HIDE);
+    let question = w(&format!("Desinstalar {}?", app.name));
+    if MessageBoxW(null_mut(), question.as_ptr(), w("Desinstalar").as_ptr(), MB_YESNO | MB_ICONQUESTION | MB_TOPMOST) != IDYES {
+        return;
+    }
+    let (name, id, icon, hwnd) = (app.name.clone(), app.id.clone(), app.icon.clone(), hwnd as isize);
+    std::thread::spawn(move || match run_script(UNINSTALL_SCRIPT, &[("Nome", &name), ("AppId", &id), ("Atalho", &icon)]) {
+        Some(NOT_FOUND) => unsafe {
+            ShellExecuteW(null_mut(), w("open").as_ptr(), w("ms-settings:appsfeatures").as_ptr(), null(), null(), SW_SHOWNORMAL);
+        },
+        _ => rebuild_catalog(hwnd as HWND),
     });
 }
 
@@ -159,6 +188,8 @@ enum Hit {
     Tile(usize),
     Row(usize),
     Toggle,
+    Profile,
+    Power,
 }
 
 #[derive(Default)]
@@ -248,6 +279,12 @@ impl Ui {
         let inside = |r: RECT| x >= r.left && x < r.right && y >= r.top && y < r.bottom;
         if self.query.trim().is_empty() && inside(TOGGLE_RECT) {
             return Some(Hit::Toggle);
+        }
+        if inside(PROFILE_RECT) {
+            return Some(Hit::Profile);
+        }
+        if inside(POWER_RECT) {
+            return Some(Hit::Power);
         }
         if y < GRID_TOP || !(24..W - 24).contains(&x) {
             return None;
@@ -466,6 +503,13 @@ unsafe fn draw(g: *mut gp::GpGraphics, ui: &mut Ui) {
 
     gp::GdipSetSolidFillColor(ui.brush, BAND);
     gp::GdipFillRectangleI(g, ui.brush as *mut gp::GpBrush, 1, FOOTER, W - 2, H - FOOTER - 1);
+    for (hit, r) in [(Hit::Profile, PROFILE_RECT), (Hit::Power, POWER_RECT)] {
+        if ui.hover == Some(hit) {
+            fill(g, ui, r.left, r.top, r.right - r.left, r.bottom - r.top, HOVER);
+        }
+    }
+    let p = POWER_RECT;
+    text(g, ui, "\u{E7E8}", ui.glyphs, layout(p.left, p.top, p.right - p.left, p.bottom - p.top), TEXT, Flow::Center);
     gp::GdipSetSolidFillColor(ui.brush, FIELD);
     gp::GdipFillEllipseI(g, ui.brush as *mut gp::GpBrush, 40, FOOTER + 16, 32, 32);
     text(g, ui, "\u{E77B}", ui.glyphs, layout(40, FOOTER + 16, 32, 32), TEXT, Flow::Center);
@@ -727,6 +771,12 @@ unsafe fn launch(hwnd: HWND, ui: &Ui, index: usize) {
     ShellExecuteW(hwnd, w("open").as_ptr(), w("explorer.exe").as_ptr(), target.as_ptr(), null(), SW_SHOWNORMAL);
 }
 
+fn uninstallable(app: &App, windows_dir: &str) -> bool {
+    let path = app.icon.replace('/', "\\").to_lowercase();
+    let system = !windows_dir.is_empty() && path.starts_with(&windows_dir.to_lowercase());
+    app.id.contains('!') || (!path.is_empty() && !system)
+}
+
 fn file_target(app: &App) -> Option<String> {
     let path = app.icon.replace('/', "\\");
     (!path.to_lowercase().ends_with(".png") && std::path::Path::new(&path).is_file()).then_some(path)
@@ -741,8 +791,10 @@ unsafe fn app_menu(hwnd: HWND, ui: &Ui, index: usize) {
         AppendMenuW(menu, MF_STRING, 2, w("Executar como administrador").as_ptr());
         AppendMenuW(menu, MF_STRING, 3, w("Abrir local do arquivo").as_ptr());
     }
-    AppendMenuW(menu, MF_SEPARATOR, 0, null());
-    AppendMenuW(menu, MF_STRING, 4, w("Desinstalar").as_ptr());
+    if uninstallable(app, &std::env::var("WINDIR").unwrap_or_default()) {
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        AppendMenuW(menu, MF_STRING, 4, w("Desinstalar").as_ptr());
+    }
     let mut pt: POINT = zeroed();
     GetCursorPos(&mut pt);
     let choice = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, null());
@@ -759,10 +811,57 @@ unsafe fn app_menu(hwnd: HWND, ui: &Ui, index: usize) {
             let select = w(&format!("/select,\"{path}\""));
             ShellExecuteW(hwnd, w("open").as_ptr(), w("explorer.exe").as_ptr(), select.as_ptr(), null(), SW_SHOWNORMAL);
         }
-        4 => {
-            ShowWindow(hwnd, SW_HIDE);
-            ShellExecuteW(hwnd, w("open").as_ptr(), w("ms-settings:appsfeatures").as_ptr(), null(), null(), SW_SHOWNORMAL);
+        4 => uninstall(hwnd, app),
+        _ => {}
+    }
+}
+
+unsafe fn popup(hwnd: HWND, items: &[&str]) -> usize {
+    let menu = CreatePopupMenu();
+    for (i, item) in items.iter().enumerate() {
+        AppendMenuW(menu, MF_STRING, i + 1, w(item).as_ptr());
+    }
+    let mut pt: POINT = zeroed();
+    GetCursorPos(&mut pt);
+    let choice = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hwnd, null());
+    DestroyMenu(menu);
+    choice as usize
+}
+
+unsafe fn open(target: &str, args: &str, show: SHOW_WINDOW_CMD) {
+    let args = w(args);
+    let args = if args.len() > 1 { args.as_ptr() } else { null() };
+    ShellExecuteW(null_mut(), w("open").as_ptr(), w(target).as_ptr(), args, null(), show);
+}
+
+unsafe fn profile_menu(hwnd: HWND) {
+    let choice = popup(hwnd, &["Alterar configurações da conta", "Bloquear", "Sair"]);
+    if choice != 0 {
+        ShowWindow(hwnd, SW_HIDE);
+    }
+    match choice {
+        1 => open("ms-settings:yourinfo", "", SW_SHOWNORMAL),
+        2 => {
+            LockWorkStation();
         }
+        3 => {
+            ExitWindowsEx(EWX_LOGOFF, 0);
+        }
+        _ => {}
+    }
+}
+
+unsafe fn power_menu(hwnd: HWND) {
+    let choice = popup(hwnd, &["Suspender", "Desligar", "Reiniciar"]);
+    if choice != 0 {
+        ShowWindow(hwnd, SW_HIDE);
+    }
+    match choice {
+        1 => {
+            SetSuspendState(0, 0, 0);
+        }
+        2 => open("shutdown.exe", "/s /t 0", SW_HIDE),
+        3 => open("shutdown.exe", "/r /t 0", SW_HIDE),
         _ => {}
     }
 }
@@ -774,6 +873,8 @@ unsafe fn activate(hwnd: HWND, ui: &mut Ui, hit: Hit) {
             ui.refresh();
         }
         Hit::Tile(i) => launch(hwnd, ui, i),
+        Hit::Profile => profile_menu(hwnd),
+        Hit::Power => power_menu(hwnd),
         Hit::Row(i) => {
             if let Some(&app) = ui.rows.get(i) {
                 launch(hwnd, ui, app);
@@ -1045,6 +1146,16 @@ mod tests {
         let a = parse("Loja\tstore!id\tC:/x/logo.png\nNotas\tnotes\tC:/Windows/System32/notepad.exe");
         assert_eq!(file_target(&a[0]), None);
         assert_eq!(file_target(&a[1]).as_deref(), Some(r"C:\Windows\System32\notepad.exe"));
+    }
+    #[test]
+    fn windows_tools_are_not_uninstallable() {
+        let a = parse("Paint\tpaint\tC:/Windows/System32/mspaint.exe\nLoja\tstore!id\nChrome\tChrome\tC:/ProgramData/Chrome.lnk\nPC\tpc");
+        let found: Vec<bool> = a.iter().map(|app| uninstallable(app, r"C:\Windows")).collect();
+        assert_eq!(found, vec![false, true, true, false]);
+    }
+    #[test]
+    fn quoted_escapes_single_quotes() {
+        assert_eq!(quoted("D'Água"), "'D''Água'");
     }
     #[test]
     fn base64_matches_rfc4648() {

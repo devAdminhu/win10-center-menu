@@ -11,7 +11,8 @@ Centered taskbar and a light Start panel for Windows 10, in one ~300 KB Rust/Win
 
 Download `MenuRust.exe` from [Releases](../../releases) and run it. The app list is built on first run (and refreshed on every start or via tray → **Atualizar apps**).
 
-- Right-click an app: open, run as admin, open file location, uninstall
+- Right-click an app: open, run as admin, open file location, uninstall (runs the app's own uninstaller; Store apps are removed directly)
+- Footer: account menu (settings, lock, sign out) and power menu (sleep, shut down, restart)
 - Pinned apps: the `$fixados` list in `catalogo.ps1`
 
 ## Build
