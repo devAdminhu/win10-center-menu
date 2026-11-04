@@ -1,0 +1,15 @@
+[package]
+name = "menu-rust"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+windows-sys = { version = "=0.59.0", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Com", "Win32_UI_Controls", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Accessibility", "Win32_Graphics_GdiPlus"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
