@@ -1,0 +1,55 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Clippy
+        run: cargo clippy --release --all-targets -- -D warnings
+
+      - name: Tests (release, includes speed check)
+        run: cargo test --release
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Size budget
+        shell: pwsh
+        run: |
+          $exe = 'target/release/menu-rust.exe'
+          $kb = [math]::Round((Get-Item $exe).Length / 1KB)
+          "Executable: $kb KB" >> $env:GITHUB_STEP_SUMMARY
+          if ($kb -gt 600) { throw "Executable grew to $kb KB (budget 600 KB)" }
+          Copy-Item $exe MenuRust.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MenuRust
+          path: MenuRust.exe
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create ${{ github.ref_name }} MenuRust.exe --title ${{ github.ref_name }} --generate-notes

@@ -21,6 +21,9 @@ const H: i32 = 472;
 const CLASS: &str = "MenuRustNative";
 const TOGGLE: u32 = WM_APP + 1;
 const TRAY: u32 = WM_APP + 2;
+const CATALOG_READY: u32 = WM_APP + 3;
+const CATALOG_SCRIPT: &str = include_str!("../catalogo.ps1");
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const POLL_START: usize = 1;
 const POLL_BAR: usize = 2;
 const PRELOAD: usize = 3;
@@ -103,6 +106,41 @@ fn alphabetical(apps: &[App]) -> Vec<usize> {
     order.sort_by_key(|&i| fold(&apps[i].name));
     order
 }
+fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, &b)| n | (b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            out.push(if i <= chunk.len() { ABC[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
+// Get-StartApps plus Appx manifests take ~15 s, so the catalog is rebuilt off the UI thread.
+fn rebuild_catalog(hwnd: HWND) {
+    let hwnd = hwnd as isize;
+    std::thread::spawn(move || {
+        use std::os::windows::process::CommandExt;
+        let output = root().join("apps.tsv").to_string_lossy().replace('\'', "''");
+        let command = format!("& {{\n{CATALOG_SCRIPT}\n}} -Saida '{output}'");
+        let encoded = base64(&command.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>());
+        let done = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", &encoded])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .is_ok_and(|s| s.success());
+        if done {
+            unsafe { PostMessageW(hwnd as HWND, CATALOG_READY, 0, 0) };
+        }
+    });
+}
+
+fn load_catalog() -> Vec<App> {
+    parse(&std::fs::read_to_string(root().join("apps.tsv")).unwrap_or_default())
+}
+
 fn short(s: &str) -> &str {
     match s {
         "Explorador de Arquivos" => "Arquivos",
@@ -211,7 +249,7 @@ impl Ui {
         if self.query.trim().is_empty() && inside(TOGGLE_RECT) {
             return Some(Hit::Toggle);
         }
-        if y < GRID_TOP || x < 24 || x >= W - 24 {
+        if y < GRID_TOP || !(24..W - 24).contains(&x) {
             return None;
         }
         if self.listing() {
@@ -338,7 +376,7 @@ struct Composition {
     size: usize,
 }
 unsafe fn acrylic(hwnd: HWND) {
-    let Some(p) = GetProcAddress(GetModuleHandleW(w("user32.dll").as_ptr()), b"SetWindowCompositionAttribute\0".as_ptr()) else { return };
+    let Some(p) = GetProcAddress(GetModuleHandleW(w("user32.dll").as_ptr()), c"SetWindowCompositionAttribute".as_ptr().cast()) else { return };
     let set: unsafe extern "system" fn(HWND, *mut Composition) -> i32 = std::mem::transmute(p);
     for (state, flags) in [(4, 0), (3, 2)] {
         let mut a = Accent { state, flags, color: 0xbb25201b, animation: 0 };
@@ -358,7 +396,16 @@ fn layout(x: i32, y: i32, width: i32, height: i32) -> gp::RectF {
     gp::RectF { X: x as f32, Y: y as f32, Width: width as f32, Height: height as f32 }
 }
 
-unsafe fn text(g: *mut gp::GpGraphics, ui: &Ui, s: &str, font: *mut gp::GpFont, r: gp::RectF, color: u32, center: bool, wrap: bool) {
+#[derive(Clone, Copy, PartialEq)]
+enum Flow {
+    Left,
+    Center,
+    Wrap,
+}
+
+unsafe fn text(g: *mut gp::GpGraphics, ui: &Ui, s: &str, font: *mut gp::GpFont, r: gp::RectF, color: u32, flow: Flow) {
+    let center = flow != Flow::Left;
+    let wrap = flow == Flow::Wrap;
     gp::GdipSetSolidFillColor(ui.brush, color);
     gp::GdipSetStringFormatAlign(ui.format, if center { 1 } else { 0 });
     gp::GdipSetStringFormatLineAlign(ui.format, if wrap { 0 } else { 1 });
@@ -385,11 +432,11 @@ unsafe fn draw(g: *mut gp::GpGraphics, ui: &mut Ui) {
     gp::GdipDeletePen(pen);
 
     fill(g, ui, 32, 26, W - 64, 40, FIELD);
-    text(g, ui, "\u{E721}", ui.glyphs, layout(48, 26, 24, 40), DIM, false, false);
+    text(g, ui, "\u{E721}", ui.glyphs, layout(48, 26, 24, 40), DIM, Flow::Left);
     if ui.query.is_empty() {
-        text(g, ui, "Pesquisar apps", ui.font, layout(76, 26, W - 140, 40), DIM, false, false);
+        text(g, ui, "Pesquisar apps", ui.font, layout(76, 26, W - 140, 40), DIM, Flow::Left);
     } else {
-        text(g, ui, &ui.query, ui.font, layout(76, 26, W - 140, 40), TEXT, false, false);
+        text(g, ui, &ui.query, ui.font, layout(76, 26, W - 140, 40), TEXT, Flow::Left);
     }
     let caret = 74 + text_width(g, ui, &ui.query, ui.font).min(W - 150);
     gp::GdipSetSolidFillColor(ui.brush, TEXT);
@@ -402,13 +449,13 @@ unsafe fn draw(g: *mut gp::GpGraphics, ui: &mut Ui) {
     } else {
         "Fixados"
     };
-    text(g, ui, title, ui.bold, layout(40, 84, 300, 28), TEXT, false, false);
+    text(g, ui, title, ui.bold, layout(40, 84, 300, 28), TEXT, Flow::Left);
     if ui.query.trim().is_empty() {
         let r = TOGGLE_RECT;
         let color = if ui.hover == Some(Hit::Toggle) { SELECTED } else { HOVER };
         fill(g, ui, r.left, r.top, r.right - r.left, r.bottom - r.top, color);
         let label = if ui.all { "‹  Voltar" } else { "Todos  ›" };
-        text(g, ui, label, ui.small, layout(r.left, r.top, r.right - r.left, r.bottom - r.top), TEXT, true, false);
+        text(g, ui, label, ui.small, layout(r.left, r.top, r.right - r.left, r.bottom - r.top), TEXT, Flow::Center);
     }
 
     if ui.listing() {
@@ -421,12 +468,16 @@ unsafe fn draw(g: *mut gp::GpGraphics, ui: &mut Ui) {
     gp::GdipFillRectangleI(g, ui.brush as *mut gp::GpBrush, 1, FOOTER, W - 2, H - FOOTER - 1);
     gp::GdipSetSolidFillColor(ui.brush, FIELD);
     gp::GdipFillEllipseI(g, ui.brush as *mut gp::GpBrush, 40, FOOTER + 16, 32, 32);
-    text(g, ui, "\u{E77B}", ui.glyphs, layout(40, FOOTER + 16, 32, 32), TEXT, true, false);
+    text(g, ui, "\u{E77B}", ui.glyphs, layout(40, FOOTER + 16, 32, 32), TEXT, Flow::Center);
     let user = std::env::var("USERNAME").unwrap_or_default();
-    text(g, ui, &user, ui.font, layout(84, FOOTER, 300, H - FOOTER), TEXT, false, false);
+    text(g, ui, &user, ui.font, layout(84, FOOTER, 300, H - FOOTER), TEXT, Flow::Left);
 }
 
 unsafe fn draw_grid(g: *mut gp::GpGraphics, ui: &mut Ui) {
+    if ui.apps.is_empty() {
+        text(g, ui, "Carregando apps…", ui.font, layout(40, GRID_TOP, 400, ROW_H), DIM, Flow::Left);
+        return;
+    }
     for i in 0..PINNED.min(ui.apps.len()) {
         let x = GRID_X + (i % COLS) as i32 * TILE_W;
         let y = GRID_TOP + (i / COLS) as i32 * TILE_H;
@@ -437,18 +488,18 @@ unsafe fn draw_grid(g: *mut gp::GpGraphics, ui: &mut Ui) {
         if image.is_null() {
             let initial = ui.apps[i].name.chars().next().unwrap_or('?').to_string();
             fill(g, ui, x + 32, y + 12, 32, 32, FIELD);
-            text(g, ui, &initial, ui.font, layout(x + 32, y + 12, 32, 32), TEXT, true, false);
+            text(g, ui, &initial, ui.font, layout(x + 32, y + 12, 32, 32), TEXT, Flow::Center);
         } else {
             gp::GdipDrawImageRectI(g, image, x + 32, y + 12, 32, 32);
         }
         let name = short(&ui.apps[i].name).to_string();
-        text(g, ui, &name, ui.small, layout(x + 4, y + 50, TILE_W - 8, 32), TEXT, true, true);
+        text(g, ui, &name, ui.small, layout(x + 4, y + 50, TILE_W - 8, 32), TEXT, Flow::Wrap);
     }
 }
 
 unsafe fn draw_list(g: *mut gp::GpGraphics, ui: &mut Ui) {
     if ui.rows.is_empty() {
-        text(g, ui, "Nada encontrado", ui.font, layout(40, GRID_TOP, 400, ROW_H), DIM, false, false);
+        text(g, ui, "Nada encontrado", ui.font, layout(40, GRID_TOP, 400, ROW_H), DIM, Flow::Left);
         return;
     }
     for k in 0..VISIBLE_ROWS {
@@ -465,7 +516,7 @@ unsafe fn draw_list(g: *mut gp::GpGraphics, ui: &mut Ui) {
             gp::GdipDrawImageRectI(g, image, 36, y + 8, 20, 20);
         }
         let name = ui.apps[app].name.clone();
-        text(g, ui, &name, ui.font, layout(68, y, W - 120, ROW_H), TEXT, false, false);
+        text(g, ui, &name, ui.font, layout(68, y, W - 120, ROW_H), TEXT, Flow::Left);
     }
     if ui.rows.len() > VISIBLE_ROWS {
         let track = VISIBLE_ROWS as i32 * ROW_H;
@@ -676,6 +727,46 @@ unsafe fn launch(hwnd: HWND, ui: &Ui, index: usize) {
     ShellExecuteW(hwnd, w("open").as_ptr(), w("explorer.exe").as_ptr(), target.as_ptr(), null(), SW_SHOWNORMAL);
 }
 
+fn file_target(app: &App) -> Option<String> {
+    let path = app.icon.replace('/', "\\");
+    (!path.to_lowercase().ends_with(".png") && std::path::Path::new(&path).is_file()).then_some(path)
+}
+
+unsafe fn app_menu(hwnd: HWND, ui: &Ui, index: usize) {
+    let Some(app) = ui.apps.get(index) else { return };
+    let target = file_target(app);
+    let menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, 1, w("Abrir").as_ptr());
+    if target.is_some() {
+        AppendMenuW(menu, MF_STRING, 2, w("Executar como administrador").as_ptr());
+        AppendMenuW(menu, MF_STRING, 3, w("Abrir local do arquivo").as_ptr());
+    }
+    AppendMenuW(menu, MF_SEPARATOR, 0, null());
+    AppendMenuW(menu, MF_STRING, 4, w("Desinstalar").as_ptr());
+    let mut pt: POINT = zeroed();
+    GetCursorPos(&mut pt);
+    let choice = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, null());
+    DestroyMenu(menu);
+    let path = target.unwrap_or_default();
+    match choice {
+        1 => launch(hwnd, ui, index),
+        2 => {
+            ShowWindow(hwnd, SW_HIDE);
+            ShellExecuteW(hwnd, w("runas").as_ptr(), w(&path).as_ptr(), null(), null(), SW_SHOWNORMAL);
+        }
+        3 => {
+            ShowWindow(hwnd, SW_HIDE);
+            let select = w(&format!("/select,\"{path}\""));
+            ShellExecuteW(hwnd, w("open").as_ptr(), w("explorer.exe").as_ptr(), select.as_ptr(), null(), SW_SHOWNORMAL);
+        }
+        4 => {
+            ShowWindow(hwnd, SW_HIDE);
+            ShellExecuteW(hwnd, w("open").as_ptr(), w("ms-settings:appsfeatures").as_ptr(), null(), null(), SW_SHOWNORMAL);
+        }
+        _ => {}
+    }
+}
+
 unsafe fn activate(hwnd: HWND, ui: &mut Ui, hit: Hit) {
     match hit {
         Hit::Toggle => {
@@ -733,6 +824,20 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             }
             return 0;
         }
+        CATALOG_READY => {
+            let apps = load_catalog();
+            if !apps.is_empty() {
+                ui.images.iter().flatten().filter(|i| !i.is_null()).for_each(|&i| {
+                    gp::GdipDisposeImage(i);
+                });
+                ui.images = vec![None; apps.len()];
+                ui.apps = apps;
+                ui.refresh();
+                SetTimer(hwnd, PRELOAD, 15, None);
+                InvalidateRect(hwnd, null(), 0);
+            }
+            return 0;
+        }
         WM_TIMER if wp == PRELOAD => {
             match ui.images.iter().position(Option::is_none) {
                 Some(first) => (first..ui.apps.len().min(first + ICONS_PER_TICK)).for_each(|i| {
@@ -758,12 +863,17 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         }
         TRAY if (lp & 0xffff) as u32 == WM_RBUTTONUP => {
             let menu = CreatePopupMenu();
+            AppendMenuW(menu, MF_STRING, 2, w("Atualizar apps").as_ptr());
             AppendMenuW(menu, MF_STRING, 1, w("Sair").as_ptr());
             let mut pt: POINT = zeroed();
             GetCursorPos(&mut pt);
             SetForegroundWindow(hwnd);
-            if TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, null()) == 1 {
-                DestroyWindow(hwnd);
+            match TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, null()) {
+                1 => {
+                    DestroyWindow(hwnd);
+                }
+                2 => rebuild_catalog(hwnd),
+                _ => {}
             }
             DestroyMenu(menu);
             return 0;
@@ -816,6 +926,18 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             }
             return 0;
         }
+        WM_RBUTTONUP => {
+            match ui.hit((lp & 0xffff) as i16 as i32, ((lp >> 16) & 0xffff) as i16 as i32) {
+                Some(Hit::Tile(i)) => app_menu(hwnd, ui, i),
+                Some(Hit::Row(i)) => {
+                    if let Some(&app) = ui.rows.get(i) {
+                        app_menu(hwnd, ui, app);
+                    }
+                }
+                _ => {}
+            }
+            return 0;
+        }
         WM_MOUSEWHEEL if ui.listing() => {
             let delta = ((wp >> 16) & 0xffff) as i16;
             let max = ui.rows.len().saturating_sub(VISIBLE_ROWS);
@@ -844,11 +966,7 @@ fn main() {
             PostMessageW(existing, TOGGLE, 0, 0);
             return;
         }
-        let apps = parse(&std::fs::read_to_string(root().join("apps.tsv")).unwrap_or_default());
-        if apps.is_empty() {
-            MessageBoxW(null_mut(), w("Rode catalogo.py antes.").as_ptr(), w("MenuRust").as_ptr(), MB_OK);
-            return;
-        }
+        let apps = load_catalog();
         let _ = CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32);
         let mut token = 0;
         let input = gp::GdiplusStartupInput { GdiplusVersion: 1, DebugEventCallback: 0, SuppressBackgroundThread: 0, SuppressExternalCodecs: 0 };
@@ -885,6 +1003,7 @@ fn main() {
         SetTimer(hwnd, POLL_START, 150, None);
         SetTimer(hwnd, POLL_BAR, 750, None);
         SetTimer(hwnd, PRELOAD, 15, None);
+        rebuild_catalog(hwnd);
         show(hwnd, &mut *state);
 
         let mut msg: MSG = zeroed();
@@ -910,6 +1029,29 @@ mod tests {
         assert_eq!(search(&a, "calc"), vec![1]);
         assert_eq!(search(&a, "joao"), vec![2]);
         assert!(search(&a, "nada").is_empty());
+    }
+    #[test]
+    fn search_stays_fast_on_large_catalogs() {
+        let catalog: String = (0..20_000).map(|i| format!("Aplicação {i}\tapp{i}!id\n")).collect();
+        let apps = parse(&catalog);
+        let start = std::time::Instant::now();
+        for q in ["aplicacao 19999", "APLICAÇÃO 5", "nada"] {
+            search(&apps, q);
+        }
+        assert!(start.elapsed().as_millis() < 300, "busca lenta: {:?}", start.elapsed());
+    }
+    #[test]
+    fn file_target_skips_store_logos() {
+        let a = parse("Loja\tstore!id\tC:/x/logo.png\nNotas\tnotes\tC:/Windows/System32/notepad.exe");
+        assert_eq!(file_target(&a[0]), None);
+        assert_eq!(file_target(&a[1]).as_deref(), Some(r"C:\Windows\System32\notepad.exe"));
+    }
+    #[test]
+    fn base64_matches_rfc4648() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
     }
     #[test]
     fn alphabetical_uses_folded_names() {
